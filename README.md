@@ -45,7 +45,7 @@ Supports standard PyG datasets:
 
 1.  **Clone the repository:**
     ```bash
-    git clone <your-repo-url>
+    git clone [<your-repo-url>](https://github.com/sandsinghal/gnn-benchmark.git)
     cd gnn_benchmark
     ```
 2.  **Create a virtual environment (recommended):**
