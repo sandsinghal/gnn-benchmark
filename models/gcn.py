@@ -18,8 +18,8 @@ class GCN(torch.nn.Module):
     ):
         super().__init__()
         # cached=True is efficient for full-batch node classification on single static graphs
-        self.conv1 = GCNConv(in_channels, hidden_channels, cached=True)
-        self.conv2 = GCNConv(hidden_channels, out_channels, cached=True)
+        self.conv1 = GCNConv(in_channels, hidden_channels, cached=False)
+        self.conv2 = GCNConv(hidden_channels, out_channels, cached=False)
         self.dropout_p = dropout
         self.num_layers = 2  # Simple property for loader setup
 

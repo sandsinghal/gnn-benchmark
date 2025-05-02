@@ -1,60 +1,76 @@
 # models/fastgcn.py
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 from torch_geometric.nn import GCNConv
-from typing import Optional
 
-
-class FastGCN(torch.nn.Module):
+class FastGCN(nn.Module):
     """
-    FastGCN model structure based on Chen et al. (2018).
-    Uses standard GCNConv layers for node classification.
-    The "Fast" aspect comes from the layer-wise importance sampling
-    strategy during training, which is handled *outside* this model definition
-    by a custom sampler (e.g., `utils.sampling.FastGcnSampler`).
+    Implements the FastGCN model architecture as described in Chen et al. (2018).
 
-    For inference/evaluation, this model is used like a standard GCN, typically
-    on the full graph.
+    This model uses standard GCNConv layers for the graph convolutions.
+    The "Fast" characteristic of FastGCN originates from the layer-wise
+    importance sampling strategy employed during the training phase.
+    This sampling mechanism is typically implemented externally, for instance,
+    within a custom data loader or the training loop itself, rather than
+    being part of the model's forward pass definition.
+
+    Args:
+        in_channels (int): Dimensionality of input node features.
+        hidden_channels (int): Dimensionality of the hidden layer features.
+        out_channels (int): Dimensionality of the output node features (e.g., number of classes).
+        dropout (float): Dropout probability applied after the activation function.
     """
-
-    def __init__(
-        self, in_channels: int, hidden_channels: int, out_channels: int, dropout: float
-    ):
+    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int, dropout: float):
         super().__init__()
-        # Use cached=False as FastGCN training involves mini-batching on varying subgraphs.
-        self.conv1 = GCNConv(in_channels, hidden_channels, cached=False)
-        self.conv2 = GCNConv(hidden_channels, out_channels, cached=False)
-        self.dropout_p = dropout
-        self.num_layers = 2  # Simple property
 
-    def forward(
-        self, x: Tensor, edge_index: Tensor, edge_weight: Optional[Tensor] = None
-    ) -> Tensor:
+        # Layer 1: GCN Convolution from input features to hidden features.
+        # `cached=False` is used because FastGCN training involves mini-batches
+        # built from varying subgraphs (due to sampling), so caching node features
+        # from a full pass isn't applicable or beneficial.
+        self.conv1 = GCNConv(in_channels, hidden_channels, cached=False)
+
+        # Layer 2: GCN Convolution from hidden features to output features.
+        self.conv2 = GCNConv(hidden_channels, out_channels, cached=False)
+
+        # Dropout probability.
+        self.dropout = dropout
+
+        # Number of convolutional layers in this specific architecture.
+        # Useful for setting up samplers that depend on the number of layers.
+        self.num_layers = 2
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor = None) -> torch.Tensor:
         """
-        Forward pass using standard GCNConv layers.
+        Performs the forward pass of the FastGCN model using standard GCN operations.
 
         Args:
-            x (Tensor): Node feature matrix [num_nodes, in_channels]. In FastGCN training,
-                        num_nodes corresponds to the number of nodes sampled for the *input*
-                        to the current layer.
-            edge_index (LongTensor): Graph connectivity of the sampled subgraph for the current
-                                     layer, in COO format [2, num_edges]. Indices are relative
-                                     to the nodes in `x`.
-            edge_weight (Tensor, optional): Renormalized edge weights for the sampled subgraph
-                                            [num_edges]. Defaults to None.
+            x (torch.Tensor): Node feature matrix (shape: [num_nodes, in_channels]).
+            edge_index (torch.Tensor): Graph connectivity in COO format (shape: [2, num_edges]).
+            edge_weight (torch.Tensor, optional): Edge weights (shape: [num_edges]). Defaults to None.
 
         Returns:
-            Tensor: Output node features (logits) [num_nodes, out_channels].
+            torch.Tensor: The output node embeddings (logits), shape [num_nodes, out_channels].
         """
+        # Apply first GCN layer
         x = self.conv1(x, edge_index, edge_weight)
+        # Apply ReLU activation function
         x = F.relu(x)
-        x = F.dropout(x, p=self.dropout_p, training=self.training)
+        # Apply dropout for regularization
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        # Apply second GCN layer
         x = self.conv2(x, edge_index, edge_weight)
-        # Output logits
+        # Return the final node embeddings (logits)
         return x
 
-    # NOTE: The performance benefits of FastGCN require the custom layer-wise sampling
-    # implemented in `utils.sampling.FastGcnSampler` and used within the
-    # `utils.training.train_fastgcn` function. Standard evaluation typically uses
-    # the full graph (`utils.training.evaluate_fastgcn`).
+    # --- Important Note on FastGCN Implementation ---
+    # To fully leverage the benefits of FastGCN, a specific layer-wise
+    # importance sampling technique must be implemented during data loading or
+    # within the training loop. This typically involves calculating sampling
+    # probabilities based on the squared L2 norm of the columns of the
+    # normalized adjacency matrix (q(v) ∝ ||Ã(:, v)||^2).
+    # The `utils/sampling.py` file provides an example sampler, but note that
+    # the reference `utils/training.py` might use standard `NeighborLoader` by default,
+    # which performs neighbor sampling, not the layer-wise importance sampling
+    # specific to FastGCN. Ensure the correct sampler is used during training.
+    # ---

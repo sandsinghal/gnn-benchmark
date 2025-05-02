@@ -59,19 +59,39 @@ def main():
         f"{config['model_name']}-{config['dataset_name']}-{task_type[0]}"
         f"-h{config['hidden_channels']}-bs{config['batch_size']}-lr{config['lr']}-s{config['seed']}"
     )
-    if config["log_to_wandb"]:
-        try:
+
+    # --- WandB Initialization (Conditional based on mode) ---
+    wandb_enabled = config["wandb_mode"] != "disabled" # Check if W&B is NOT disabled
+    print(f"W&B Logging Mode: {config['wandb_mode']}") # Inform user
+
+    if wandb_enabled: # Use the new flag
+         try:
             wandb.init(
                 project=config["wandb_project"],
                 config=config,
                 name=run_name,
                 resume="allow",
-                settings=wandb.Settings(start_method="fork"), # Use 'fork' for better compatibility unless CUDA issues arise
+                settings=wandb.Settings(start_method="fork"),
+                mode=config['wandb_mode'] # <-- Pass the configured mode
             )
-            print(f"Initialized Weights & Biases run: {run_name}")
-        except Exception as e:
-            print(f"Error initializing W&B: {e}. Set --no-log_to_wandb to disable.")
-            config['log_to_wandb'] = False # Disable if init fails
+            print(f"Initialized Weights & Biases run: {run_name} (Mode: {config['wandb_mode']})")
+         except Exception as e:
+            print(f"Error initializing W&B: {e}. Disabling W&B for this run.")
+            wandb_enabled = False # Ensure it's disabled if init fails
+    # --- End WandB Initialization ---
+    # if config["log_to_wandb"]:
+    #     try:
+    #         wandb.init(
+    #             project=config["wandb_project"],
+    #             config=config,
+    #             name=run_name,
+    #             resume="allow",
+    #             settings=wandb.Settings(start_method="fork"), # Use 'fork' for better compatibility unless CUDA issues arise
+    #         )
+    #         print(f"Initialized Weights & Biases run: {run_name}")
+    #     except Exception as e:
+    #         print(f"Error initializing W&B: {e}. Set --no-log_to_wandb to disable.")
+    #         config['log_to_wandb'] = False # Disable if init fails
 
     print(f"Task Type: {task_type}")
     print(f"Run Name: {run_name}")
@@ -123,7 +143,8 @@ def main():
             # Node classification datasets often have predefined splits (masks or separate datasets like PPI)
             if config['dataset_name'] == 'PPI':
                 # PPI requires loading splits separately
-                train_dataset = dataset # The loaded 'train' split
+                # train_dataset = dataset # The loaded 'train' split
+                train_dataset = PPI(root=os.path.join(config['data_dir'], 'PPI'), split='train')
                 val_dataset = PPI(root=os.path.join(config['data_dir'], 'PPI'), split='val')
                 test_dataset = PPI(root=os.path.join(config['data_dir'], 'PPI'), split='test')
                 print(f"Loaded PPI Dataset Splits - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
@@ -153,7 +174,8 @@ def main():
     print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total Trainable Parameters: {total_params:,}")
-    if config["log_to_wandb"]:
+    # if config["log_to_wandb"]:
+    if wandb_enabled and wandb.run: # Check wandb.run to ensure init was successful
         wandb.summary["Total Parameters"] = total_params
         # Log gradients and parameters, adjust log_freq as needed
         wandb.watch(model, log_freq=max(100, config.get("log_freq", 100)), log="all")
@@ -282,7 +304,7 @@ def main():
                         num_neighbors_list = num_neighbors_cfg
 
                     # Use a larger batch size for evaluation if desired
-                    eval_batch_size = loader_batch_size * 2
+                    eval_batch_size = loader_batch_size * 1
                     print(f"NeighborLoader sampling: {num_neighbors_list} neighbors per layer.")
 
                     common_loader_params = {
@@ -425,7 +447,8 @@ def main():
                 log_dict["Train F1-Micro"] = val_metrics['f1_micro'].get('train', float('nan'))
                 log_dict["Test F1-Micro"] = val_metrics['f1_micro'].get('test', float('nan'))
 
-        if config["log_to_wandb"]:
+        # if config["log_to_wandb"]:
+        if wandb_enabled and wandb.run: # Check if wandb is active
             wandb.log(log_dict, step=epoch)
 
         # Print epoch summary
@@ -475,7 +498,8 @@ def main():
         print(f"Loading best model state from epoch {best_epoch} (Val {metric_to_optimize.capitalize()}: {best_val_metric:.4f})")
         model.load_state_dict(best_model_state)
         # Save best model artifact to WandB if enabled
-        if config["log_to_wandb"] and wandb.run:
+        # if config["log_to_wandb"] and wandb.run:
+        if wandb_enabled and wandb.run and best_model_state: # Check if W&B active and state exists
             try:
                 model_path = os.path.join(wandb.run.dir, "best_model.pt")
                 torch.save(best_model_state, model_path)
@@ -540,13 +564,16 @@ def main():
         print(f"Final Test F1-Macro: {final_test_f1_macro:.4f}")
 
     # Log final metrics to WandB summary
-    if config["log_to_wandb"] and wandb.run:
+    if wandb_enabled and wandb.run: # Check if W&B active
+    # if config["log_to_wandb"] and wandb.run:
         wandb.summary["Best Epoch"] = best_epoch
         wandb.summary[f"Best Val {metric_to_optimize.capitalize()}"] = best_val_metric
         wandb.summary["Final Test Loss"] = final_test_loss
         wandb.summary[final_test_metric_name] = final_test_metric
         if not is_multilabel and not np.isnan(final_test_f1_macro):
             wandb.summary["Final Test F1-Macro"] = final_test_f1_macro
+        wandb.finish()
+    elif wandb.run: # If wandb somehow initialized but became disabled later, still finish
         wandb.finish()
 
     print("\n--- Experiment Complete ---")

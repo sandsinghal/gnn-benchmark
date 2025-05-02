@@ -1,480 +1,517 @@
 # utils/training.py
-from typing import Any, Dict, Optional, Tuple, Union, List
-
-import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score
-from torch import Tensor
-from torch.nn import Module
-from torch.optim import Optimizer
-from torch_geometric.data import Batch, Data
-from torch_geometric.loader import DataLoader, NeighborLoader
-from tqdm import tqdm
+from tqdm import tqdm # For progress bars
+import warnings
+import sys
 
-from .sampling import FastGcnSampler # Required for type hinting
+# ==============================================================================
+#                    Full-Batch Training & Evaluation
+# ==============================================================================
+# Suitable for datasets that fit entirely into memory (e.g., Cora, CiteSeer)
 
-
-# === Full-Batch Training & Evaluation (for single, small graphs) ===
-
-def train_full_batch(
-    model: Module, data: Data, optimizer: Optimizer, criterion: Module
-) -> float:
-    """Performs one training epoch for full-batch datasets (e.g., Planetoid)."""
-    model.train()
-    optimizer.zero_grad()
-
-    # Ensure data is on the correct device (should be done in main.py)
-    # Pass x, edge_index, and optional edge_weight to the model
-    out = model(data.x, data.edge_index, getattr(data, "edge_weight", None))
-
-    # Use the training mask to select nodes for loss calculation
-    mask = data.train_mask
-    if mask.sum() == 0:
-         print("Warning: No training nodes found in train_mask.")
-         return 0.0
-
-    # Handle multi-label vs single-label targets for loss calculation
-    target_y = data.y[mask]
-    if isinstance(criterion, torch.nn.BCEWithLogitsLoss):
-        target_y = target_y.float() # BCE requires float targets
-
-    loss = criterion(out[mask], target_y)
-
-    if torch.isnan(loss) or torch.isinf(loss):
-        print("Warning: NaN/Inf loss detected during training. Skipping backward pass.")
-        return 0.0 # Or handle differently
-
-    loss.backward()
-    optimizer.step()
-    return loss.item()
-
-
-@torch.no_grad()
-def evaluate_full_batch(
-    model: Module, data: Data, criterion: Module, is_multilabel: bool = False
-) -> Dict[str, Dict[str, Optional[float]]]:
+def train_full_batch(model: torch.nn.Module, data: 'torch_geometric.data.Data',
+                     optimizer: torch.optim.Optimizer, criterion: torch.nn.Module) -> float:
     """
-    Evaluates model performance on full-batch datasets (train/val/test splits).
+    Performs one training epoch on a full-batch dataset.
 
     Args:
-        model: The GNN model.
-        data: The PyG Data object containing the full graph and masks.
-        criterion: The loss function.
-        is_multilabel: Boolean flag indicating if the task is multi-label.
+        model (torch.nn.Module): The GNN model.
+        data (Data): The graph data object containing features, labels, edge_index, and masks.
+        optimizer (torch.optim.Optimizer): The optimizer.
+        criterion (torch.nn.Module): The loss function.
 
     Returns:
-        A dictionary containing loss, accuracy (or None), f1_macro (or None),
-        and f1_micro (or None) for each split ('train', 'val', 'test').
+        float: The training loss for the epoch.
     """
-    model.eval()
-    # Ensure data is on the correct device (should be done in main.py)
-    out = model(data.x, data.edge_index, getattr(data, "edge_weight", None))
+    model.train() # Set model to training mode
+    optimizer.zero_grad() # Clear gradients
 
-    # Initialize metrics dictionary
-    metrics: Dict[str, Dict[str, Optional[float]]] = {
-        "loss": {},
-        "acc": {},      # Accuracy (usually for multi-class)
-        "f1_macro": {}, # Macro F1 (usually for multi-class)
-        "f1_micro": {}, # Micro F1 (usually for multi-label)
-    }
+    # Perform forward pass using the full graph data
+    # Assumes model.forward signature is (x, edge_index, edge_weight=None)
+    out = model(data.x, data.edge_index, getattr(data, 'edge_weight', None))
 
-    for split in ["train", "val", "test"]:
-        mask = getattr(data, f"{split}_mask", None)
+    # Apply the training mask to select nodes for loss calculation
+    mask = data.train_mask
+    # Calculate loss only on training nodes
+    loss = criterion(out[mask], data.y[mask])
 
-        # Skip split if mask doesn't exist or is empty
+    # Backpropagate gradients and update model weights
+    loss.backward()
+    optimizer.step()
+
+    return loss.item() # Return the scalar loss value
+
+
+@torch.no_grad() # Disable gradient calculations for evaluation
+def evaluate_full_batch(model: torch.nn.Module, data: 'torch_geometric.data.Data',
+                        criterion: torch.nn.Module, is_multilabel: bool = False) -> dict:
+    """
+    Evaluates model performance on full-batch datasets for train, validation, and test splits.
+
+    Calculates loss, accuracy (for multi-class), and F1 scores (macro for multi-class,
+    micro for multi-label).
+
+    Args:
+        model (torch.nn.Module): The GNN model.
+        data (Data): The graph data object.
+        criterion (torch.nn.Module): The loss function.
+        is_multilabel (bool): Flag indicating if the task is multi-label classification.
+                               Defaults to False (multi-class).
+
+    Returns:
+        dict: A dictionary containing evaluation metrics ('loss', 'acc', 'f1_macro', 'f1_micro')
+              for each split ('train', 'val', 'test'). Metrics might be NaN if a split is missing
+              or empty, or None if not applicable (e.g., acc for multi-label).
+    """
+    model.eval() # Set model to evaluation mode
+
+    # Perform forward pass on the full graph
+    out = model(data.x, data.edge_index, getattr(data, 'edge_weight', None))
+
+    # Initialize dictionary to store metrics
+    metrics = {'loss': {}, 'acc': {}, 'f1_macro': {}, 'f1_micro': {}}
+
+    # Evaluate performance on each data split (train, validation, test)
+    for split in ['train', 'val', 'test']:
+        mask = getattr(data, f'{split}_mask', None) # Get the mask for the current split
+
+        # Check if the mask exists and contains any nodes
         if mask is None or mask.sum() == 0:
-            metrics["loss"][split] = float("nan")
-            metrics["acc"][split] = None
-            metrics["f1_macro"][split] = None
-            metrics["f1_micro"][split] = None
-            continue
+            # Assign NaN to metrics if split is invalid or empty
+            metrics['loss'][split] = float('nan')
+            metrics['acc'][split] = float('nan')
+            metrics['f1_macro'][split] = float('nan')
+            metrics['f1_micro'][split] = float('nan')
+            continue # Skip to the next split
+
+        # Get ground truth labels for the current split (move to CPU for metrics calculation)
+        y_true = data.y[mask].cpu()
 
         # --- Calculate Loss ---
         try:
-            target_y_loss = data.y[mask]
-            if is_multilabel: target_y_loss = target_y_loss.float()
-            loss = criterion(out[mask], target_y_loss)
-            metrics["loss"][split] = loss.item()
+             # For multi-label tasks using BCEWithLogitsLoss, target labels need to be float
+             target_y_loss = data.y[mask].float() if is_multilabel else data.y[mask]
+             loss = criterion(out[mask], target_y_loss)
+             metrics['loss'][split] = loss.item()
         except Exception as e:
-            # print(f"Warning: Could not compute loss for split '{split}'. Error: {e}")
-            metrics["loss"][split] = float("nan")
+             # warnings.warn(f"Could not compute loss for split '{split}'. Error: {e}")
+             metrics['loss'][split] = float('nan') # Indicate loss calculation failure
 
-        # --- Calculate Accuracy / F1 ---
-        y_true_cpu = data.y[mask].cpu() # Move labels to CPU for sklearn metrics
-
+        # --- Calculate Accuracy / F1 Score ---
         if is_multilabel:
-            # Get predictions using sigmoid and threshold
-            preds_cpu = (torch.sigmoid(out[mask]) > 0.5).int().cpu()
-            # Micro F1 is standard for multi-label node classification
-            metrics["f1_micro"][split] = f1_score(
-                y_true_cpu, preds_cpu, average="micro", zero_division=0
-            )
-            # Accuracy and Macro F1 are less standard/meaningful here
-            metrics["acc"][split] = None
-            metrics["f1_macro"][split] = None
-        else: # Multi-class classification
-            # Get predictions using argmax
-            preds_cpu = out[mask].argmax(dim=1).cpu()
-            # Accuracy and Macro F1 are standard
-            metrics["acc"][split] = accuracy_score(y_true_cpu, preds_cpu)
-            metrics["f1_macro"][split] = f1_score(
-                y_true_cpu, preds_cpu, average="macro", zero_division=0
-            )
-             # Micro F1 usually equals accuracy in multi-class single-label cases
-            metrics["f1_micro"][split] = None
-
+            # Multi-label: Apply sigmoid, threshold at 0.5, compute F1-micro
+            preds = (torch.sigmoid(out[mask]) > 0.5).int().cpu()
+            # Accuracy and F1-macro are typically not standard for multi-label node classification
+            metrics['acc'][split] = None
+            metrics['f1_macro'][split] = None
+            # F1-micro is common for multi-label tasks
+            metrics['f1_micro'][split] = f1_score(y_true, preds, average='micro', zero_division=0)
+        else:
+            # Multi-class: Apply argmax, compute accuracy and F1-macro
+            preds = out[mask].argmax(dim=1).cpu()
+            metrics['acc'][split] = accuracy_score(y_true, preds)
+            metrics['f1_macro'][split] = f1_score(y_true, preds, average='macro', zero_division=0)
+            # F1-micro is less common/interpretable for multi-class node classification
+            metrics['f1_micro'][split] = None
 
     return metrics
 
 
-# === Mini-Batch Training & Evaluation (NeighborLoader / DataLoader) ===
+# ==============================================================================
+#          Mini-Batch Training & Evaluation (Standard Loaders)
+# ==============================================================================
+# Suitable for large graphs using NeighborLoader (node classification) or
+# DataLoader (graph classification, or node classification like PPI).
 
-def train_minibatch(
-    model: Module,
-    loader: Union[DataLoader, NeighborLoader],
-    optimizer: Optimizer,
-    criterion: Module,
-    device: torch.device,
-    is_multilabel: bool = False,
-    is_graph_classification: bool = False,
-    desc: str = "Train Minibatch",
-) -> float:
-    """Performs one training epoch for minibatch datasets (Node or Graph classification)."""
-    model.train()
+def train_minibatch(model: torch.nn.Module, loader: object, optimizer: torch.optim.Optimizer,
+                    criterion: torch.nn.Module, device: torch.device,
+                    is_multilabel: bool = False, is_graph_classification: bool = False,
+                    desc: str = "Train Mini-Batch") -> float:
+    """
+    Performs one training epoch using a standard mini-batch loader
+    (e.g., NeighborLoader, DataLoader).
+
+    Args:
+        model (torch.nn.Module): The GNN model.
+        loader: The PyG DataLoader or NeighborLoader instance.
+        optimizer (torch.optim.Optimizer): The optimizer.
+        criterion (torch.nn.Module): The loss function.
+        device (torch.device): The device to train on (e.g., 'cuda' or 'cpu').
+        is_multilabel (bool): Flag for multi-label classification. Defaults to False.
+        is_graph_classification (bool): Flag for graph classification task. Defaults to False.
+        desc (str): Description for the tqdm progress bar.
+
+    Returns:
+        float: The average training loss for the epoch.
+    """
+    model.train() # Set model to training mode
     total_loss = 0.0
-    num_processed_items = 0 # Can be nodes or graphs depending on loader type
+    num_processed = 0 # Tracks total nodes or graphs processed for averaging loss
 
+    # Iterate over mini-batches provided by the loader
     for batch in tqdm(loader, desc=desc, leave=False):
-        # Skip potentially empty batches, especially from NeighborLoader if masks are sparse
-        if (not is_graph_classification and hasattr(batch, 'batch_size') and \
-           (batch.x is None or batch.x.shape[0] == 0 or batch.batch_size == 0)) or \
-           (is_graph_classification and (batch.x is None or batch.x.shape[0] == 0)):
-            # print("Warning: Skipping empty batch.")
-            continue
+        batch = batch.to(device) # Move batch data to the target device
+        optimizer.zero_grad() # Clear gradients
 
-        batch = batch.to(device)
-        optimizer.zero_grad()
+        # --- Input Validation & Skipping Empty Batches ---
+        # Skip batches that might be empty (e.g., due to sampling issues)
+        if not is_graph_classification and hasattr(batch, 'batch_size') and \
+           (batch.x is None or batch.x.shape[0] == 0 or batch.batch_size == 0):
+            continue # Skip empty node classification batches (NeighborLoader)
+        if is_graph_classification and (batch.x is None or batch.x.shape[0] == 0):
+            continue # Skip empty graph classification batches (DataLoader)
 
-        edge_weight = getattr(batch, "edge_weight", None)
+        # Get edge weights if available in the batch
+        edge_weight = getattr(batch, 'edge_weight', None)
 
-        # --- Model Forward Pass ---
-        # Adapt model call based on task and expected signature
-        try:
-            if is_graph_classification:
-                # Graph models (like DGCNN) might need the `batch` vector
-                # Assumes models accept x, edge_index, batch, [edge_weight]
+        # --- Model Forward Pass (Adapts to Task Type) ---
+        if is_graph_classification:
+            # Graph Classification (usually DataLoader)
+            # Models might need the 'batch' vector for pooling.
+            try:
+                # Try passing all common arguments
                 out = model(batch.x, batch.edge_index, batch.batch, edge_weight=edge_weight)
-                target_out = out # Graph output corresponds to graph labels
+            except TypeError: # Handle models with different forward signatures
+                 try:
+                     # Try without edge_weight
+                     out = model(batch.x, batch.edge_index, batch.batch)
+                 except TypeError:
+                     # Try minimal signature (common for simpler models)
+                     out = model(batch.x, batch.edge_index)
+
+            target_out = out # Output corresponds to graphs
+            target_y = batch.y # Labels correspond to graphs
+            loss_count = batch.num_graphs # Loss is averaged over graphs in the batch
+        else:
+            # Node Classification (NeighborLoader or DataLoader like PPI)
+            # Standard node models expect x, edge_index, [edge_weight]
+            out = model(batch.x, batch.edge_index, edge_weight=edge_weight)
+
+            if hasattr(batch, 'batch_size'): # NeighborLoader convention
+                # Output for the first 'batch_size' nodes corresponds to target nodes
+                target_out = out[:batch.batch_size]
+                target_y = batch.y[:batch.batch_size]
+                loss_count = batch.batch_size # Loss is averaged over target nodes
+            else: # Assume DataLoader for node classification (e.g., PPI)
+                # Output corresponds to all nodes in the batch (subgraph)
+                target_out = out
                 target_y = batch.y
-                loss_count = batch.num_graphs # Loss is calculated per graph
-            else: # Node classification (NeighborLoader or PPI DataLoader)
-                # Node models expect x, edge_index, [edge_weight]
-                out = model(batch.x, batch.edge_index, edge_weight=edge_weight)
-                # For NeighborLoader, predictions/labels correspond to the first `batch_size` nodes
-                if hasattr(batch, 'batch_size'):
-                    target_out = out[:batch.batch_size]
-                    target_y = batch.y[:batch.batch_size]
-                    loss_count = batch.batch_size # Loss per node in the batch center
-                else: # Assume DataLoader for PPI node classification - use all nodes
-                    target_out = out
-                    target_y = batch.y
-                    loss_count = batch.num_nodes # Loss per node in the graph(s)
-        except TypeError as e:
-             print(f"Error during model forward pass: {e}. Check model signature.")
-             print(f"Input shapes: x={batch.x.shape}, edge_index={batch.edge_index.shape}, batch={batch.batch.shape if batch.batch else None}")
-             continue # Skip batch on error
-        except Exception as e:
-             print(f"Unexpected error during model forward pass: {e}")
-             continue
+                loss_count = batch.num_nodes # Loss is averaged over all nodes in the batch
 
         # --- Loss Calculation ---
-        if target_y is None or target_out.shape[0] != target_y.shape[0]:
-             print(f"Warning: Skipping batch due to label mismatch or missing labels. Out shape: {target_out.shape}, Label shape: {target_y.shape if target_y is not None else 'None'}")
+        if is_multilabel:
+            # BCEWithLogitsLoss expects float targets
+            loss = criterion(target_out, target_y.float())
+        else:
+            # CrossEntropyLoss expects long targets
+            loss = criterion(target_out, target_y)
+
+        # Skip batch if loss is invalid
+        if torch.isnan(loss) or torch.isinf(loss):
+             warnings.warn(f"NaN or Inf loss detected in batch. Skipping batch.")
              continue
 
-        if is_multilabel:
-            loss = criterion(target_out, target_y.float()) # BCE requires float targets
-        else:
-            loss = criterion(target_out, target_y) # CrossEntropy expects long targets
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            print("Warning: NaN/Inf loss detected. Skipping batch backward pass.")
-            continue # Skip update if loss is invalid
-
+        # --- Backpropagation and Optimization ---
         loss.backward()
         optimizer.step()
 
+        # Accumulate loss and count processed items
         total_loss += loss.item() * loss_count
-        num_processed_items += loss_count
+        num_processed += loss_count
 
     # Return average loss over all processed items (nodes or graphs)
-    return total_loss / num_processed_items if num_processed_items > 0 else 0.0
+    return total_loss / num_processed if num_processed > 0 else 0.0
 
 
-@torch.no_grad()
-def evaluate_minibatch(
-    model: Module,
-    loader: Union[DataLoader, NeighborLoader],
-    criterion: Module,
-    device: torch.device,
-    is_multilabel: bool = False,
-    is_graph_classification: bool = False,
-    desc="Evaluate Minibatch",
-) -> Dict[str, Optional[float]]:
-    """Evaluates model performance on minibatch datasets (Node or Graph classification)."""
-    model.eval()
-    all_preds: List[Tensor] = []
-    all_labels: List[Tensor] = []
+@torch.no_grad() # Disable gradient calculations for evaluation
+def evaluate_minibatch(model: torch.nn.Module, loader: object, criterion: torch.nn.Module,
+                       device: torch.device, is_multilabel: bool = False,
+                       is_graph_classification: bool = False,
+                       desc: str = "Evaluate Mini-Batch") -> dict:
+    """
+    Evaluates model performance using a standard mini-batch loader.
+
+    Accumulates predictions and labels across batches to compute overall metrics.
+
+    Args:
+        model (torch.nn.Module): The GNN model.
+        loader: The PyG DataLoader or NeighborLoader instance.
+        criterion (torch.nn.Module): The loss function.
+        device (torch.device): The device to evaluate on.
+        is_multilabel (bool): Flag for multi-label classification. Defaults to False.
+        is_graph_classification (bool): Flag for graph classification task. Defaults to False.
+        desc (str): Description for the tqdm progress bar.
+
+    Returns:
+        dict: A dictionary containing evaluation metrics ('loss', 'acc', 'f1_macro', 'f1_micro').
+              Metrics might be NaN/0.0 if loader is empty, or None if not applicable.
+    """
+    model.eval() # Set model to evaluation mode
+    all_preds = []   # List to store predictions from all batches
+    all_labels = []  # List to store true labels from all batches
     total_loss = 0.0
-    num_processed_items = 0
+    num_processed = 0 # Tracks total nodes or graphs processed
 
+    # Iterate over mini-batches
     for batch in tqdm(loader, desc=desc, leave=False):
-        # Skip empty batches
-        if (not is_graph_classification and hasattr(batch, 'batch_size') and \
-           (batch.x is None or batch.x.shape[0] == 0 or batch.batch_size == 0)) or \
-           (is_graph_classification and (batch.x is None or batch.x.shape[0] == 0)):
+        batch = batch.to(device) # Move data to device
+
+        # --- Input Validation & Skipping Empty Batches ---
+        if not is_graph_classification and hasattr(batch, 'batch_size') and \
+           (batch.x is None or batch.x.shape[0] == 0 or batch.batch_size == 0):
+            continue
+        if is_graph_classification and (batch.x is None or batch.x.shape[0] == 0):
             continue
 
-        batch = batch.to(device)
-        edge_weight = getattr(batch, "edge_weight", None)
+        # Get edge weights if available
+        edge_weight = getattr(batch, 'edge_weight', None)
 
-        # --- Model Forward Pass ---
-        try:
-            if is_graph_classification:
+        # --- Model Forward Pass (Adapts to Task Type) ---
+        if is_graph_classification:
+            # Graph Classification
+            try:
                 out = model(batch.x, batch.edge_index, batch.batch, edge_weight=edge_weight)
-                target_out = out
-                target_y = batch.y
-                count = batch.num_graphs
-            else: # Node classification
-                out = model(batch.x, batch.edge_index, edge_weight=edge_weight)
-                if hasattr(batch, 'batch_size'): # NeighborLoader
-                    target_out = out[:batch.batch_size]
-                    target_y = batch.y[:batch.batch_size]
-                    count = batch.batch_size
-                else: # PPI DataLoader
+            except TypeError: # Fallback signatures
+                 try:
+                     out = model(batch.x, batch.edge_index, batch.batch)
+                 except TypeError:
+                     out = model(batch.x, batch.edge_index)
+            target_out = out
+            target_y = batch.y
+            count = batch.num_graphs # Items processed in this batch
+        else:
+            # Node Classification
+            out = model(batch.x, batch.edge_index, edge_weight=edge_weight)
+            if hasattr(batch, 'batch_size'): # NeighborLoader
+                target_out = out[:batch.batch_size]
+                target_y = batch.y[:batch.batch_size]
+                count = batch.batch_size
+            else: # PPI DataLoader
+                try:    
                     target_out = out
                     target_y = batch.y
                     count = batch.num_nodes
-        except TypeError as e:
-             print(f"Error during model evaluation forward pass: {e}. Check model signature.")
-             continue
-        except Exception as e:
-             print(f"Unexpected error during model evaluation forward pass: {e}")
-             continue
+                except RuntimeError as e:
+                    print("Error during forward computation:")
+                    print("  target_out.shape:", target_out.shape)
+                    print("  target_y.unique():", torch.unique(target_y))
+                    raise
 
-        # --- Loss Calculation ---
-        if target_y is None or target_out.shape[0] != target_y.shape[0]:
-             print(f"Warning: Skipping eval batch due to label mismatch. Out: {target_out.shape}, Label: {target_y.shape if target_y is not None else 'None'}")
-             continue
-
+        # --- Calculate Loss ---
         try:
-            loss = criterion(target_out, target_y.float() if is_multilabel else target_y)
+            if is_multilabel:
+                loss = criterion(target_out, target_y.float())
+            else:
+                loss = criterion(target_out, target_y)
+
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 total_loss += loss.item() * count
-                num_processed_items += count
+                num_processed += count
             else:
-                loss = torch.tensor(float("nan")) # Mark invalid loss
-        except Exception:
-            loss = torch.tensor(float("nan")) # Mark invalid loss on error
+                loss = torch.tensor(float('nan')) # Mark loss as invalid for this batch
+        except Exception as e:
+            warnings.warn(f"Could not compute loss for evaluation batch. Error: {e}")
+            loss = torch.tensor(float('nan')) # Mark loss as invalid
 
-
-        # --- Store Predictions and Labels (on CPU) ---
+        # --- Store Predictions and Labels (Move to CPU) ---
         if is_multilabel:
             preds = (torch.sigmoid(target_out) > 0.5).int().cpu()
-        else: # Multi-class (node or graph)
-            preds = target_out.argmax(dim=1).cpu()
+        elif is_graph_classification: # Graph predictions
+             preds = target_out.argmax(dim=1).cpu()
+        else: # Node predictions (multi-class)
+             preds = target_out.argmax(dim=1).cpu()
 
         labels = target_y.cpu()
         all_preds.append(preds)
         all_labels.append(labels)
 
-    avg_loss = total_loss / num_processed_items if num_processed_items > 0 else float("nan")
+    # --- Aggregate Metrics Across All Batches ---
+    avg_loss = total_loss / num_processed if num_processed > 0 else float('nan')
 
-    # Handle case where no batches were processed
+    # Handle case where loader was empty or all batches were skipped
     if not all_preds:
-        print("Warning: No predictions generated during evaluation (loader might be empty).")
-        return {"loss": avg_loss, "acc": 0.0, "f1_macro": 0.0, "f1_micro": 0.0}
+        metrics = {'loss': avg_loss, 'acc': 0.0, 'f1_macro': 0.0, 'f1_micro': 0.0}
+        warnings.warn("Evaluation resulted in no predictions. Returning zero metrics.")
+        return metrics
 
-    # Concatenate all batch results
-    final_preds = torch.cat(all_preds, dim=0)
-    final_labels = torch.cat(all_labels, dim=0)
+    # Concatenate predictions and labels from all batches
+    all_preds = torch.cat(all_preds, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
 
-    # --- Calculate Final Metrics ---
-    metrics: Dict[str, Optional[float]] = {"loss": avg_loss}
-    if is_multilabel: # Usually PPI Node classification
-        metrics["f1_micro"] = f1_score(
-            final_labels, final_preds, average="micro", zero_division=0
-        )
-        metrics["acc"] = None # Accuracy less meaningful
-        metrics["f1_macro"] = None # Macro F1 less standard
-    else: # Multi-class Node or Graph classification
-        metrics["acc"] = accuracy_score(final_labels, final_preds)
-        metrics["f1_macro"] = f1_score(
-            final_labels, final_preds, average="macro", zero_division=0
-        )
-        metrics["f1_micro"] = None # Micro F1 usually equals accuracy
+    # Calculate final metrics based on task type
+    if is_multilabel: # Typically Node classification (e.g., PPI)
+        f1_micro = f1_score(all_labels.numpy(), all_preds.numpy(), average='micro', zero_division=0)
+        metrics = {'loss': avg_loss, 'acc': None, 'f1_macro': None, 'f1_micro': f1_micro}
+    else: # Node or Graph classification (multi-class)
+        acc = accuracy_score(all_labels.numpy(), all_preds.numpy())
+        f1_macro = f1_score(all_labels.numpy(), all_preds.numpy(), average='macro', zero_division=0)
+        metrics = {'loss': avg_loss, 'acc': acc, 'f1_macro': f1_macro, 'f1_micro': None}
 
     return metrics
 
 
-# === FastGCN Specific Training & Evaluation ===
+# ==============================================================================
+#             FastGCN Mini-Batch Training & Evaluation
+# ==============================================================================
+# Specific training loop for models using the FastGcnSampler.
+# Evaluation typically uses the standard full-batch method.
 
-def train_fastgcn(
-    model: Module,
-    loader: FastGcnSampler, # Expects the custom sampler
-    optimizer: Optimizer,
-    criterion: Module,
-    device: torch.device,
-    desc="Train FastGCN",
-) -> float:
-    """Performs one training epoch using FastGCN layer-wise sampling."""
-    model.train()
+def train_fastgcn(model: 'FastGCN', loader: 'FastGcnSampler', optimizer: torch.optim.Optimizer,
+                  criterion: torch.nn.Module, device: torch.device,
+                  desc: str = "Train FastGCN") -> float:
+    """
+    Performs one training epoch using the FastGCN layer-wise sampling strategy.
+
+    Args:
+        model (FastGCN): The FastGCN model instance. Should have `num_layers` and accessible conv layers.
+        loader (FastGcnSampler): The custom FastGCN sampler instance.
+        optimizer (torch.optim.Optimizer): The optimizer.
+        criterion (torch.nn.Module): The loss function.
+        device (torch.device): The device to train on.
+        desc (str): Description for the tqdm progress bar.
+
+    Returns:
+        float: The average training loss for the epoch.
+    """
+    model.train() # Set model to training mode
     total_loss = 0.0
-    num_processed_nodes = 0
+    num_processed = 0 # Tracks total number of nodes for which loss was computed
 
     # --- Access Convolutional Layers ---
-    # Find the convolutional layers within the model (assumes a common structure)
-    model_convs: List[Module] = []
+    # Dynamically access the model's convolutional layers
+    model_convs = []
     if hasattr(model, 'convs') and isinstance(model.convs, torch.nn.ModuleList):
-         model_convs = list(model.convs)
-    elif hasattr(model, 'conv1'): # Fallback for 2-layer manual definition
+         # Assumes layers are stored in a ModuleList named 'convs'
+         model_convs = model.convs
+    elif hasattr(model, 'conv1'):
+         # Fallback for manually defined layers (like the example FastGCN model)
          model_convs.append(model.conv1)
          if hasattr(model, 'conv2'):
               model_convs.append(model.conv2)
+         # Add more checks here if models with > 2 manually defined layers are expected
     else:
-         raise AttributeError("Cannot find convolutional layers (e.g., 'conv1', 'conv2', or 'convs') in the FastGCN model.")
+         raise AttributeError("Cannot find convolutional layers in the FastGCN model. Expected 'convs' (ModuleList) or 'conv1'/'conv2'.")
 
-    num_layers = len(model_convs)
-    model_dropout = getattr(model, 'dropout_p', getattr(model, 'dropout', 0.0)) # Get dropout rate
+    # Sanity check: number of layers reported by model vs. found conv layers
+    if model.num_layers != len(model_convs):
+         warnings.warn(f"Model's `num_layers` ({model.num_layers}) does not match the number of "
+                       f"found convolutional layers ({len(model_convs)}). Using {len(model_convs)} layers.")
+         actual_num_layers = len(model_convs) # Use the number of layers actually found
+    else:
+         actual_num_layers = model.num_layers
 
-    # Iterate through batches provided by the FastGCN sampler
-    # Each batch contains layer-wise sampled node features and subgraph structures
+    # Iterate over layer-wise batches provided by the FastGcnSampler
     for layerwise_batch_data in tqdm(loader, desc=desc, leave=False):
-        # layerwise_batch_data is a list of dictionaries, one per layer + final labels
-        # Example: [ {'x': L0_x, 'edge_index': L0_adj, 'edge_weight': L0_w, 'nodes': L0_nodes_orig_idx}, # Layer 0 input
-        #            {'x': L1_x, 'edge_index': L1_adj, 'edge_weight': L1_w, 'nodes': L1_nodes_orig_idx}, # Layer 1 input
-        #            ...
-        #            {'nodes': Final_nodes_orig_idx, 'y': Final_y} ] # Final layer output nodes & labels
-
-        optimizer.zero_grad()
+        # `layerwise_batch_data` is a list of dicts, one per layer + final info.
+        # Each dict contains CPU tensors ('x', 'edge_index', 'edge_weight', 'nodes', 'y')
+        optimizer.zero_grad() # Clear gradients
 
         # --- Layer-wise Forward Pass ---
-        # Start with features of nodes sampled for the *first* layer's input
+        # Start with input features for the first layer (layer 0)
+        # These correspond to the nodes sampled specifically for layer 0's input.
         layer0_info = layerwise_batch_data[0]
-        h = layer0_info['x'].to(device, non_blocking=True).float() # Ensure float features
+        # Initial hidden state `h` is the feature matrix for the first layer's input nodes
+        h = layer0_info['x'].to(device, non_blocking=True) # Move features to device
 
-        # The nodes corresponding to the *final* output of the network
-        # are the 'nodes' from the *last dictionary* in the list.
-        # These are the nodes for which we calculate the loss.
-        final_output_nodes_info = layerwise_batch_data[-1]
-        nodes_for_loss_orig_idx = final_output_nodes_info['nodes'] # Original indices
+        # Iterate through the actual number of convolutional layers found
+        for l in range(actual_num_layers):
+            # Get the pre-calculated data for the current layer `l`
+            layer_info = layerwise_batch_data[l]
+            # Move subgraph connectivity and weights to the device
+            current_edge_index = layer_info['edge_index'].to(device, non_blocking=True)
+            current_edge_weight = layer_info['edge_weight'].to(device, non_blocking=True)
+            # Ensure the hidden state `h` is on the correct device (should be from previous iter or initial)
+            h = h.to(device)
 
-        # Propagate through layers
-        for l in range(num_layers):
-            # Get the pre-sampled subgraph structure for this layer
-            # Note: The 'x' in layer_info[l] is the *input* features for conv layer 'l'.
-            # The edge_index/weight are for the subgraph connecting these input nodes.
-            current_layer_subgraph_info = layerwise_batch_data[l]
-            current_edge_index = current_layer_subgraph_info['edge_index'].to(device, non_blocking=True)
-            # Ensure edge_weight is float
-            current_edge_weight = current_layer_subgraph_info['edge_weight'].to(device, non_blocking=True).float()
-
-            # Apply the l-th GCN layer
+            # Apply the l-th convolutional layer
             conv_layer = model_convs[l]
             h = conv_layer(h, current_edge_index, current_edge_weight)
 
             # Apply activation and dropout (except after the last layer)
-            if l < num_layers - 1:
+            if l < actual_num_layers - 1:
                 h = F.relu(h)
-                h = F.dropout(h, p=model_dropout, training=True)
+                # Use model's dropout prob and ensure it's active during training
+                h = F.dropout(h, p=model.dropout, training=True)
 
-            # For the *next* iteration (l+1), the input features 'h' must correspond
-            # to the nodes sampled as input for that *next* layer.
-            # We need to select the rows of 'h' that correspond to layer_info[l+1]['nodes']
-            # This requires careful mapping between node indices across layers.
-            # The current FastGcnSampler implementation structures the data such that:
-            # - layer_info[l]['x'] are the features for nodes needed as input to conv[l]
-            # - h = conv[l](...) are the output features for these same nodes.
-            # - layer_info[l+1]['x'] should be derived by *selecting* the correct rows from 'h'
-            #   based on the node indices provided in layer_info[l+1]['nodes'] relative to layer_info[l]['nodes'].
-            # --> The provided `FastGcnSampler._create_layerwise_batch` seems to handle this by providing
-            #     the correctly subsetted 'x' for each layer dictionary already.
-            #     So, we just need to update 'h' for the next layer's input.
-            if l < num_layers - 1:
-                 next_layer_input_info = layerwise_batch_data[l+1]
-                 h = next_layer_input_info['x'].to(device, non_blocking=True).float() # Use the pre-sampled features
-
-
-        # Final output `out = h` corresponds to nodes `nodes_for_loss_orig_idx`
+        # The final `h` contains the output embeddings for the nodes that were
+        # input to the *first* layer (layer 0).
         out = h
 
         # --- Loss Calculation ---
-        # Fetch the ground truth labels for the final output nodes
-        target_y = final_output_nodes_info['y'].to(device, non_blocking=True)
+        # The final output `out` corresponds to the nodes provided as input to layer 0.
+        # We need the ground truth labels for *these specific nodes*.
+        # The last element of `layerwise_batch_data` contains the target nodes and labels
+        # for the *original* batch request (output layer nodes), but the FastGCN forward
+        # pass structure means the `out` tensor aligns with the *input* nodes of layer 0.
 
-        # Check for size consistency
+        # Get the indices of the nodes corresponding to the output `out`
+        # These are the nodes from layer 0's input dictionary.
+        nodes_for_loss_cpu = layer0_info['nodes'].cpu() # Ensure indices are on CPU
+
+        # Retrieve the corresponding labels from the sampler's full label tensor (which is on CPU)
+        if not hasattr(loader, 'y'):
+             raise AttributeError("FastGCN sampler ('loader') must have access to the full label tensor via a 'y' attribute.")
+        try:
+            target_y_cpu = loader.y[nodes_for_loss_cpu]
+        except IndexError as e:
+            print(f"Error indexing labels: indices shape={nodes_for_loss_cpu.shape}, loader.y shape={loader.y.shape}")
+            raise e
+
+        # Move the fetched labels to the target device
+        target_y = target_y_cpu.to(device, non_blocking=True)
+
+        # --- Size Sanity Check ---
         if out.shape[0] != target_y.shape[0]:
-            print(f"FATAL ERROR in train_fastgcn: Output size ({out.shape[0]}) mismatch "
-                  f"with target size ({target_y.shape[0]}). Skipping batch.")
-            continue
+            # This should ideally not happen if the logic is correct.
+            warnings.warn(f"Output size ({out.shape[0]}) mismatch with target label size ({target_y.shape[0]}) "
+                          f"for nodes {nodes_for_loss_cpu.shape}. Skipping batch.")
+            continue # Skip this batch if sizes don't align
 
-        # Handle multi-label vs single-label loss
-        if isinstance(criterion, torch.nn.BCEWithLogitsLoss):
-            loss = criterion(out, target_y.float())
-        else:
-            loss = criterion(out, target_y)
+        # Calculate loss between model output and ground truth labels
+        loss = criterion(out, target_y)
 
+        # Skip batch if loss is invalid
         if torch.isnan(loss) or torch.isinf(loss):
-             print("Warning: NaN/Inf loss detected in FastGCN. Skipping batch backward pass.")
+             warnings.warn(f"NaN or Inf loss detected during FastGCN training. Skipping batch.")
              continue
 
+        # --- Backpropagation and Optimization ---
         loss.backward()
         optimizer.step()
 
-        batch_node_count = target_y.shape[0] # Loss calculated over final sampled nodes
+        # Accumulate loss, weighted by the number of nodes in this batch's output
+        batch_node_count = target_y.shape[0] # Loss computed over these nodes
         total_loss += loss.item() * batch_node_count
-        num_processed_nodes += batch_node_count
+        num_processed += batch_node_count
 
-    return total_loss / num_processed_nodes if num_processed_nodes > 0 else 0.0
+    # Return the average loss over all processed nodes
+    return total_loss / num_processed if num_processed > 0 else 0.0
 
 
-@torch.no_grad()
-def evaluate_fastgcn(
-    model: Module,
-    full_data_cpu: Data, # Requires full graph data on CPU
-    criterion: Module,
-    device: torch.device,
-    is_multilabel: bool = False,
-) -> Dict[str, Dict[str, Optional[float]]]:
+@torch.no_grad() # Disable gradient calculations for evaluation
+def evaluate_fastgcn(model: torch.nn.Module, full_data: 'torch_geometric.data.Data',
+                     criterion: torch.nn.Module, device: torch.device,
+                     is_multilabel: bool = False) -> dict:
     """
-    Evaluates FastGCN model using standard full-graph inference.
-    (FastGCN paper uses full graph for evaluation).
+    Evaluates a model trained with FastGCN using standard full-graph inference.
+
+    The FastGCN paper typically evaluates performance by running the trained
+    model on the entire graph, similar to standard GCN evaluation.
 
     Args:
-        model: The FastGCN model (structurally same as GCN).
-        full_data_cpu: The full PyG Data object (on CPU).
-        criterion: The loss function.
-        device: The device to perform evaluation on.
-        is_multilabel: Boolean flag for multi-label tasks.
+        model (torch.nn.Module): The trained GNN model.
+        full_data (Data): The complete graph data object.
+        criterion (torch.nn.Module): The loss function.
+        device (torch.device): The device to evaluate on.
+        is_multilabel (bool): Flag indicating if the task is multi-label classification.
 
     Returns:
-        Metrics dictionary similar to evaluate_full_batch.
+        dict: A dictionary containing evaluation metrics from `evaluate_full_batch`.
     """
-    model.eval()
-    print("Evaluating FastGCN using full graph inference...")
-    # Move data to the target device for evaluation
-    try:
-        full_data_gpu = full_data_cpu.to(device)
-    except Exception as e:
-        print(f"Error moving full data to {device} for FastGCN evaluation: {e}")
-        # Return dummy metrics or raise error
-        return {
-            "loss": {"train": float("nan"), "val": float("nan"), "test": float("nan")},
-            "acc": {"train": None, "val": None, "test": None},
-            "f1_macro": {"train": None, "val": None, "test": None},
-            "f1_micro": {"train": None, "val": None, "test": None},
-        }
-
+    print("Evaluating FastGCN-trained model using full graph inference...")
+    # Ensure the full dataset is on the evaluation device
+    full_data = full_data.to(device)
     # Use the standard full-batch evaluation function
-    return evaluate_full_batch(model, full_data_gpu, criterion, is_multilabel)
+    return evaluate_full_batch(model, full_data, criterion, is_multilabel)
