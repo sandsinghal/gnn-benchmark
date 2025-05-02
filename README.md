@@ -24,7 +24,6 @@ Supports standard PyG datasets:
 *   **Graph Classification (from TUDataset):**
     *   MUTAG
     *   PROTEINS
-    *   IMDB-BINARY
     *   *(Can be extended by adding names to `config.py` and `data/load_data.py`)*
 
 ## Features
@@ -114,8 +113,6 @@ python main.py --model_name DGCNN_SortPool --dataset_name MUTAG --device cuda
 # Run DGCNN_SortPool on PROTEINS with different hyperparameters
 python main.py --model_name DGCNN_SortPool --dataset_name PROTEINS --hidden_channels 128 --dgcnn_sortpool_k 40 --lr 0.0005 --batch_size 128 --device cuda
 
-# Run DGCNN_SortPool on IMDB-BINARY
-python main.py --model_name DGCNN_SortPool --dataset_name IMDB-BINARY --device cuda
 ```
 
 **Note on TUDataset Splitting:** The current implementation in `main.py` uses a basic random 80/10/10 split for graph classification datasets. For rigorous benchmarking, consider using predefined splits if available or more standard cross-validation techniques.
